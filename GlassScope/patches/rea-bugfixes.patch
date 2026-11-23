@@ -1,0 +1,119 @@
+--- a/src/cli/argvParser.ts
++++ b/src/cli/argvParser.ts
+@@ -181,6 +181,12 @@
+     if (token.startsWith("--no-") && token.length > 5) {
+       const name = optionName(token.slice(5));
+       if (name === undefined) return parseFailure(`Unknown flag: ${token}`);
++      // Negation is defined for boolean flags only. Accepting `--no-<x>` for
++      // number/string/array options would bind a non-string `false` that the
++      // value coercion cannot handle and fail validation with a misleading
++      // "expected number, received boolean" style error later.
++      if (optionsSchema !== undefined && !isBoolean(optionsSchema, name))
++        return parseFailure(`Unknown flag: ${token}`);
+       options[name] = false;
+     } else if (token.startsWith("--")) {
+       const equals = token.indexOf("=");
+--- a/src/cli/cliJsonInput.ts
++++ b/src/cli/cliJsonInput.ts
+@@ -136,7 +136,7 @@
+     if (accessDeniedSystemCode(cause) !== undefined)
+       return jsonFileReadError(value, operation, cause);
+     if (
+-      ["{", "["].includes(value.trimStart()[0] ?? "") &&
++      plausibleInlineJson(value) &&
+       cannotBeAnExistingFile(cause) &&
+       !hasExplicitJsonFileExtension(value)
+     )
+@@ -349,6 +349,20 @@
+     cause.code === "ENAMETOOLONG" ||
+     cause.code === "ENOTDIR");
+ 
++/**
++ * A brace-leading argument that failed both inline parsing and its file read
++ * is treated as inline JSON only when it could actually start a JSON document
++ * (`{` followed by a quoted key, or an array). `{data}` and friends cannot
++ * begin valid JSON at all — those are mistyped file paths, so the file read
++ * error (which names the path and the system code) is the truthful diagnostic
++ * instead of a misleading "expected JSON".
++ */
++const plausibleInlineJson = (value: string): boolean => {
++  const trimmed = value.trimStart();
++  if (trimmed.startsWith("[")) return true;
++  return /^\{\s*"/.test(trimmed);
++};
++
+ const hasExplicitJsonFileExtension = (value: string): boolean =>
+   value.toLowerCase().endsWith(".json");
+ 
+--- a/src/cli/outputFilter.ts
++++ b/src/cli/outputFilter.ts
+@@ -15,7 +15,7 @@
+ export type OutputFilterPath = readonly OutputFilterSegment[];
+ 
+ export interface OutputFilterError {
+-  readonly kind: "unclosed_slice" | "extra_slice_bounds";
++  readonly kind: "unclosed_slice" | "extra_slice_bounds" | "missing_slice_bounds";
+ }
+ 
+ /** Split on commas outside `[...]`; an empty last path is dropped. */
+@@ -57,6 +57,12 @@
+     segments.push(...keySegments(remaining.slice(0, open)));
+     const bounds = remaining.slice(open + 1, close).split(",");
+     if (bounds.length > 2) return err({ kind: "extra_slice_bounds" });
++    if (bounds.length !== 2 || bounds[0] === "" || bounds[1] === "") {
++      // `a[5]`, `a[5,]`, `a[,3]` and `a[]` would otherwise collapse into
++      // NaN/0 bounds and silently select nothing; refuse them like the
++      // >2-bounds case so the user learns the slice is malformed.
++      return err({ kind: "missing_slice_bounds" });
++    }
+     const [start, end] = bounds;
+     segments.push({ start: Number(start), end: Number(end) });
+     remaining = remaining.slice(close + 1);
+--- a/src/cliBuiltinArguments.ts
++++ b/src/cliBuiltinArguments.ts
+@@ -132,12 +132,17 @@
+   for (let index = 0; index < normalized.length; index += 1) {
+     const argument = normalized[index]!;
+     const next = normalized[index + 1];
++    // Bare `-v` is the documented short spelling of `--version`: normalize it
++    // here so every consumer reads `flags.has("--version")` uniformly. A
++    // following value still belongs to a command-local version option.
++    const bareVersion =
++      (argument === "--version" || argument === "-v") &&
++      (next === undefined || next.startsWith("-"));
+     if (
+       (CLI_BUILTIN_FLAGS.has(argument) && argument !== "--timings") ||
+-      // A following value belongs to a command-local `--version` option.
+-      (argument === "--version" && (next === undefined || next.startsWith("-")))
++      bareVersion
+     ) {
+-      flags.add(argument);
++      flags.add(bareVersion ? "--version" : argument);
+       continue;
+     }
+     if (spacedOutputValue(argument, next) !== undefined) {
+--- a/src/cliOneShot.ts
++++ b/src/cliOneShot.ts
+@@ -137,8 +137,7 @@
+     global.command[0] !== CLI_COMMANDS.uninstall &&
+     !global.flags.has("--help") &&
+     !global.flags.has("-h") &&
+-    !global.flags.has("--version") &&
+-    !global.flags.has("-v")
++    !global.flags.has("--version")
+   ) {
+     const { loadUserConfiguration } =
+       await import("./application/UserConfigurationStore.js");
+--- a/src/cliOutput.ts
++++ b/src/cliOutput.ts
+@@ -281,7 +281,9 @@
+       message:
+         filterPaths.error.kind === "unclosed_slice"
+           ? "The --filter-output expression has a slice without a closing ]. Close the slice or remove --filter-output."
+-          : "The --filter-output expression has a slice with more than two bounds. Use [start,end].",
++          : filterPaths.error.kind === "missing_slice_bounds"
++            ? "The --filter-output expression has a slice with a missing or empty bound. Use [start,end]."
++            : "The --filter-output expression has a slice with more than two bounds. Use [start,end].",
+     };
+   const delimited = format === "csv" || format === "tsv";
+   // Name missing delimited controls before their combination checks; preserve
